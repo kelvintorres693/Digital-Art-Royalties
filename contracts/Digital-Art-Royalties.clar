@@ -12,6 +12,7 @@
 
 (define-data-var token-id-nonce uint u1)
 (define-data-var platform-fee-percentage uint u250)
+(define-data-var provenance-entry-nonce uint u1)
 
 (define-map token-metadata
     uint
@@ -48,6 +49,25 @@
     uint
 )
 
+(define-map artwork-provenance
+    uint
+    {
+        entry-id: uint,
+        token-id: uint,
+        from-owner: principal,
+        to-owner: principal,
+        transaction-type: (string-ascii 16),
+        price: uint,
+        timestamp: uint,
+        next-entry: (optional uint),
+    }
+)
+
+(define-map token-provenance-head
+    uint
+    uint
+)
+
 (define-public (mint-artwork
         (name (string-ascii 64))
         (description (string-ascii 256))
@@ -71,6 +91,9 @@
             total-earned: u0,
         })
         (var-set token-id-nonce (+ token-id u1))
+        (unwrap-panic (record-provenance-entry token-id (as-contract tx-sender) tx-sender
+            "mint" u0
+        ))
         (ok token-id)
     )
 )
@@ -116,6 +139,7 @@
         (try! (as-contract (stx-transfer? royalty-amount tx-sender artist)))
         (try! (as-contract (stx-transfer? platform-fee tx-sender contract-owner)))
         (try! (nft-transfer? digital-art token-id seller tx-sender))
+        (unwrap-panic (record-provenance-entry token-id seller tx-sender "sale" price))
         (map-delete listings token-id)
         (map-set token-royalties token-id
             (merge royalty-info { total-earned: (+ (get total-earned royalty-info) royalty-amount) })
@@ -135,6 +159,7 @@
     (begin
         (asserts! (is-eq tx-sender sender) err-not-token-owner)
         (try! (nft-transfer? digital-art token-id sender recipient))
+        (unwrap-panic (record-provenance-entry token-id sender recipient "transfer" u0))
         (ok true)
     )
 )
@@ -235,13 +260,54 @@
     )
 )
 
-(define-public (batch-mint (artworks (list 10
+(define-private (record-provenance-entry
+        (token-id uint)
+        (from-owner principal)
+        (to-owner principal)
+        (transaction-type (string-ascii 16))
+        (price uint)
+    )
+    (let (
+            (entry-id (var-get provenance-entry-nonce))
+            (current-head (map-get? token-provenance-head token-id))
+        )
+        (map-set artwork-provenance entry-id {
+            entry-id: entry-id,
+            token-id: token-id,
+            from-owner: from-owner,
+            to-owner: to-owner,
+            transaction-type: transaction-type,
+            price: price,
+            timestamp: stacks-block-height,
+            next-entry: current-head,
+        })
+        (map-set token-provenance-head token-id entry-id)
+        (var-set provenance-entry-nonce (+ entry-id u1))
+        (ok true)
+    )
+)
+
+(define-read-only (get-artwork-provenance (token-id uint))
+    (map-get? token-provenance-head token-id)
+)
+
+(define-read-only (get-provenance-entry (entry-id uint))
+    (map-get? artwork-provenance entry-id)
+)
+
+(define-read-only (get-provenance-count)
+    (- (var-get provenance-entry-nonce) u1)
+)
+
+(define-public (batch-mint (artworks (list
+    10
     {
-    name: (string-ascii 64),
-    description: (string-ascii 256),
-    image-uri: (string-ascii 256),
-    royalty-percentage: uint,
-})))
+        name: (string-ascii 64),
+        description: (string-ascii 256),
+        image-uri: (string-ascii 256),
+        royalty-percentage: uint,
+    }
+)))
     (fold mint-artwork-helper artworks (ok (list)))
 )
 
