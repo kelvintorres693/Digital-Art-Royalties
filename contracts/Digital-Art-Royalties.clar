@@ -9,10 +9,16 @@
 (define-constant err-token-not-found (err u105))
 (define-constant err-already-listed (err u106))
 (define-constant err-not-listed (err u107))
+(define-constant err-collection-not-found (err u108))
+(define-constant err-not-collection-creator (err u109))
+(define-constant err-artwork-already-in-collection (err u110))
+(define-constant err-collection-full (err u111))
+(define-constant err-invalid-collection-bonus (err u112))
 
 (define-data-var token-id-nonce uint u1)
 (define-data-var platform-fee-percentage uint u250)
 (define-data-var provenance-entry-nonce uint u1)
+(define-data-var collection-id-nonce uint u1)
 
 (define-map token-metadata
     uint
@@ -66,6 +72,35 @@
 (define-map token-provenance-head
     uint
     uint
+)
+
+;; Collection System Maps
+(define-map collections
+    uint
+    {
+        name: (string-ascii 64),
+        description: (string-ascii 256),
+        creator: principal,
+        created-at: uint,
+        artwork-count: uint,
+        royalty-bonus: uint, ;; Additional percentage for collection sales
+        is-active: bool,
+    }
+)
+
+(define-map collection-artworks
+    {collection-id: uint, token-id: uint}
+    bool
+)
+
+(define-map artwork-collection
+    uint ;; token-id
+    uint ;; collection-id
+)
+
+(define-map user-collections
+    principal
+    (list 20 uint)
 )
 
 (define-public (mint-artwork
@@ -328,6 +363,216 @@
             error (err error)
         )
         error (err error)
+    )
+)
+
+;; Collection Management Functions
+(define-public (create-collection
+        (name (string-ascii 64))
+        (description (string-ascii 256))
+        (royalty-bonus uint)
+    )
+    (let ((collection-id (var-get collection-id-nonce)))
+        (asserts! (<= royalty-bonus u500) err-invalid-collection-bonus) ;; Max 5% bonus
+        (map-set collections collection-id {
+            name: name,
+            description: description,
+            creator: tx-sender,
+            created-at: stacks-block-height,
+            artwork-count: u0,
+            royalty-bonus: royalty-bonus,
+            is-active: true,
+        })
+        (map-set user-collections tx-sender
+            (unwrap-panic (as-max-len?
+                (append (default-to (list) (map-get? user-collections tx-sender)) collection-id)
+                u20
+            ))
+        )
+        (var-set collection-id-nonce (+ collection-id u1))
+        (ok collection-id)
+    )
+)
+
+(define-public (add-artwork-to-collection
+        (token-id uint)
+        (collection-id uint)
+    )
+    (let (
+            (collection (unwrap! (map-get? collections collection-id) err-collection-not-found))
+            (token-meta (unwrap! (map-get? token-metadata token-id) err-token-not-found))
+        )
+        (asserts! (is-eq tx-sender (get creator collection)) err-not-collection-creator)
+        (asserts! (is-eq tx-sender (get creator token-meta)) err-not-token-owner)
+        (asserts! (get is-active collection) err-collection-not-found)
+        (asserts! (< (get artwork-count collection) u50) err-collection-full) ;; Max 50 artworks per collection
+        (asserts! (is-none (map-get? artwork-collection token-id)) err-artwork-already-in-collection)
+        
+        (map-set collection-artworks {collection-id: collection-id, token-id: token-id} true)
+        (map-set artwork-collection token-id collection-id)
+        (map-set collections collection-id
+            (merge collection { artwork-count: (+ (get artwork-count collection) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (remove-artwork-from-collection (token-id uint))
+    (let (
+            (collection-id (unwrap! (map-get? artwork-collection token-id) err-collection-not-found))
+            (collection (unwrap! (map-get? collections collection-id) err-collection-not-found))
+            (token-meta (unwrap! (map-get? token-metadata token-id) err-token-not-found))
+        )
+        (asserts! (is-eq tx-sender (get creator collection)) err-not-collection-creator)
+        (asserts! (is-eq tx-sender (get creator token-meta)) err-not-token-owner)
+        
+        (map-delete collection-artworks {collection-id: collection-id, token-id: token-id})
+        (map-delete artwork-collection token-id)
+        (map-set collections collection-id
+            (merge collection { artwork-count: (- (get artwork-count collection) u1) })
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-collection-status (collection-id uint))
+    (let ((collection (unwrap! (map-get? collections collection-id) err-collection-not-found)))
+        (asserts! (is-eq tx-sender (get creator collection)) err-not-collection-creator)
+        (map-set collections collection-id
+            (merge collection { is-active: (not (get is-active collection)) })
+        )
+        (ok (not (get is-active collection)))
+    )
+)
+
+(define-public (update-collection-info
+        (collection-id uint)
+        (new-name (string-ascii 64))
+        (new-description (string-ascii 256))
+    )
+    (let ((collection (unwrap! (map-get? collections collection-id) err-collection-not-found)))
+        (asserts! (is-eq tx-sender (get creator collection)) err-not-collection-creator)
+        (map-set collections collection-id
+            (merge collection { 
+                name: new-name,
+                description: new-description 
+            })
+        )
+        (ok true)
+    )
+)
+
+;; Enhanced buy function with collection bonus
+(define-public (buy-artwork-enhanced (token-id uint))
+    (let (
+            (listing (unwrap! (map-get? listings token-id) err-listing-not-found))
+            (price (get price listing))
+            (seller (get seller listing))
+            (royalty-info (unwrap! (map-get? token-royalties token-id) err-token-not-found))
+            (artist (get artist royalty-info))
+            (base-royalty-percentage (get percentage royalty-info))
+            (collection-id-opt (map-get? artwork-collection token-id))
+            (collection-bonus (match collection-id-opt
+                some-collection-id (match (map-get? collections some-collection-id)
+                    some-collection (if (get is-active some-collection)
+                        (get royalty-bonus some-collection)
+                        u0
+                    )
+                    u0
+                )
+                u0
+            ))
+            (total-royalty-percentage (+ base-royalty-percentage collection-bonus))
+            (platform-fee (/ (* price (var-get platform-fee-percentage)) u10000))
+            (royalty-amount (/ (* price total-royalty-percentage) u10000))
+            (seller-amount (- (- price platform-fee) royalty-amount))
+        )
+        (try! (stx-transfer? price tx-sender (as-contract tx-sender)))
+        (try! (as-contract (stx-transfer? seller-amount tx-sender seller)))
+        (try! (as-contract (stx-transfer? royalty-amount tx-sender artist)))
+        (try! (as-contract (stx-transfer? platform-fee tx-sender contract-owner)))
+        (try! (nft-transfer? digital-art token-id seller tx-sender))
+        (unwrap-panic (record-provenance-entry token-id seller tx-sender "enhanced-sale" price))
+        (map-delete listings token-id)
+        (map-set token-royalties token-id
+            (merge royalty-info { total-earned: (+ (get total-earned royalty-info) royalty-amount) })
+        )
+        (map-set user-balances artist
+            (+ (default-to u0 (map-get? user-balances artist)) royalty-amount)
+        )
+        (ok true)
+    )
+)
+
+;; Collection Read-Only Functions
+(define-read-only (get-collection (collection-id uint))
+    (map-get? collections collection-id)
+)
+
+(define-read-only (get-user-collections (user principal))
+    (default-to (list) (map-get? user-collections user))
+)
+
+(define-read-only (get-artwork-collection (token-id uint))
+    (map-get? artwork-collection token-id)
+)
+
+(define-read-only (is-artwork-in-collection
+        (token-id uint)
+        (collection-id uint)
+    )
+    (default-to false (map-get? collection-artworks {collection-id: collection-id, token-id: token-id}))
+)
+
+(define-read-only (get-collection-artwork-count (collection-id uint))
+    (match (map-get? collections collection-id)
+        collection (some (get artwork-count collection))
+        none
+    )
+)
+
+(define-read-only (get-last-collection-id)
+    (- (var-get collection-id-nonce) u1)
+)
+
+(define-read-only (calculate-enhanced-royalty
+        (token-id uint)
+        (sale-price uint)
+    )
+    (let (
+            (royalty-info (unwrap! (map-get? token-royalties token-id) err-token-not-found))
+            (base-percentage (get percentage royalty-info))
+            (collection-id-opt (map-get? artwork-collection token-id))
+            (collection-bonus (match collection-id-opt
+                some-collection-id (match (map-get? collections some-collection-id)
+                    some-collection (if (get is-active some-collection)
+                        (get royalty-bonus some-collection)
+                        u0
+                    )
+                    u0
+                )
+                u0
+            ))
+            (total-percentage (+ base-percentage collection-bonus))
+        )
+        (ok {
+            base-royalty: (/ (* sale-price base-percentage) u10000),
+            collection-bonus: (/ (* sale-price collection-bonus) u10000),
+            total-royalty: (/ (* sale-price total-percentage) u10000),
+            total-percentage: total-percentage
+        })
+    )
+)
+
+(define-read-only (get-collection-stats (collection-id uint))
+    (match (map-get? collections collection-id)
+        collection (some {
+            collection: collection,
+            total-artworks: (get artwork-count collection),
+            is-active: (get is-active collection),
+            royalty-bonus: (get royalty-bonus collection)
+        })
+        none
     )
 )
 
